@@ -217,3 +217,23 @@ venv*/
 # Local configuration may contain API keys or tunnel credentials
 /config/config.json
 .aider*
+
+# Temporary verification / debug artifacts
+_check_deps.py
+_import_check.py
+_import_check.txt
+_import_result.txt
+_pytest_results.xml
+_pytest_risk.txt
+_run_pytest.py
+check_imports.py
+fix.py
+fix_test.py
+output.txt
+pytest_output.txt
+replace.py
+results.txt
+run_pytest.py
+run_test.py
+test_debug.py
+/config.json
