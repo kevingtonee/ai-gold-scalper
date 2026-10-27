@@ -213,3 +213,7 @@ venv*/
 **/.terraform/
 **/venv*/
 **/__pycache__/
+
+# Local configuration may contain API keys or tunnel credentials
+/config/config.json
+.aider*

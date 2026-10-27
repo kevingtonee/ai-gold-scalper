@@ -1,0 +1,1 @@
+"""AI Gold Scalper test suite."""

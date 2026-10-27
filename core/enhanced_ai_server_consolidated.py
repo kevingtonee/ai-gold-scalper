@@ -24,7 +24,11 @@ import asyncio
 import aiohttp
 import time
 import hashlib
+import math
 import threading
+import hmac
+import secrets
+from pathlib import Path
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -32,10 +36,16 @@ from flask_caching import Cache
 import openai
 from typing import Dict, List, Tuple, Optional, Any, Union
 import joblib
-import torch
-import torch.nn as nn
+try:  # torch is optional; the inference path uses joblib-loaded sklearn models
+    import torch  # noqa: F401
+    import torch.nn as nn  # noqa: F401
+    TORCH_AVAILABLE = True
+except Exception:  # pragma: no cover - torch is an optional heavy dependency
+    torch = None  # type: ignore
+    nn = None  # type: ignore
+    TORCH_AVAILABLE = False
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
+from functools import lru_cache, wraps
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -138,34 +148,106 @@ class ModelInferenceEngine:
         self.model_performance = {}
         self.feature_list = None
         self.lock = threading.Lock()
+        self.trusted_model_dir = Path(os.environ.get("AI_MODEL_DIR", os.path.join(os.getcwd(), "models", "trained"))).resolve()
         
-    def load_model(self, model_name: str, model_path: str, scaler_path: str = None, version: str = "1.0") -> bool:
-        """Load model and optional scaler for inference"""
+    def load_model(self, model_name: str, model_path: str, scaler_path: str = None, version: str = "1.0", manifest_path: str = None, scaler_manifest_path: str = None) -> bool:
+        """Load a model only after trusted-path and manifest/hash verification."""
         try:
-            with self.lock:
-                if os.path.exists(model_path):
-                    model = joblib.load(model_path)
-                    self.models[model_name] = model
-                    self.model_versions[model_name] = version
-                    
-                    # Load scaler if provided
-                    if scaler_path and os.path.exists(scaler_path):
-                        scaler = joblib.load(scaler_path)
-                        self.scalers[model_name] = scaler
-                        logger.info(f"Loaded scaler for {model_name}")
-                    
-                    self.model_performance[model_name] = {
-                        'loaded_at': datetime.now().isoformat(),
-                        'predictions': 0,
-                        'avg_inference_time': 0.0,
-                        'version': version
-                    }
-                    
-                    logger.info(f"Model {model_name} v{version} loaded successfully")
-                    return True
+            trusted_dir = self.trusted_model_dir
+            def _resolve(path_value):
+                if not path_value:
+                    return None
+                candidate = Path(path_value)
+                if not candidate.is_absolute():
+                    candidate = trusted_dir / candidate
+                resolved = candidate.resolve()
+                if resolved.suffix.lower() not in {".pkl", ".joblib"}:
+                    raise ValueError(f"unsupported model file type: {resolved.suffix}")
+                try:
+                    resolved.relative_to(trusted_dir.resolve())
+                except ValueError as exc:
+                    raise ValueError("model path is outside the trusted model directory") from exc
+                return resolved
+
+            def _load_manifest(path_obj, explicit_manifest=None):
+                candidates = []
+                if explicit_manifest:
+                    c = Path(explicit_manifest)
+                    if not c.is_absolute():
+                        c = path_obj.parent / c
+                    candidates.append(c)
                 else:
-                    logger.warning(f"Model file not found: {model_path}")
-                    return False
+                    candidates.extend([
+                        path_obj.with_name(path_obj.stem + ".manifest.json"),
+                        path_obj.with_suffix(path_obj.suffix + ".manifest.json"),
+                        path_obj.parent / "manifest.json",
+                    ])
+                for candidate in candidates:
+                    if candidate.exists():
+                        with open(candidate, "r", encoding="utf-8") as f:
+                            manifest = json.load(f)
+                        if not isinstance(manifest, dict):
+                            raise ValueError("model manifest must be a JSON object")
+                        return manifest
+                raise ValueError(f"missing model manifest for {path_obj.name}")
+
+            def _verify(path_obj, manifest):
+                if "sha256" not in manifest or "version" not in manifest:
+                    raise ValueError("model manifest missing required fields")
+                expected = str(manifest["sha256"]).lower()
+                if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+                    raise ValueError("model manifest sha256 must be a 64-character hex string")
+                actual = hashlib.sha256(path_obj.read_bytes()).hexdigest()
+                if not hmac.compare_digest(actual, expected):
+                    raise ValueError("model hash mismatch")
+                signing_key = os.environ.get("AI_MODEL_MANIFEST_KEY") or os.environ.get("MODEL_MANIFEST_SIGNING_KEY")
+                if signing_key:
+                    if not manifest.get("signature"):
+                        raise ValueError("signed model manifest required but signature is missing")
+                    payload = json.dumps({k: manifest[k] for k in sorted(manifest) if k != "signature"}, sort_keys=True)
+                    expected_sig = hmac.new(signing_key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+                    if not hmac.compare_digest(str(manifest["signature"]).lower(), expected_sig):
+                        raise ValueError("model manifest signature mismatch")
+
+            resolved_model_path = _resolve(model_path)
+            if resolved_model_path is None or not resolved_model_path.exists():
+                logger.warning(f"Model file not found: {model_path}")
+                return False
+            manifest = _load_manifest(resolved_model_path, manifest_path)
+            if manifest.get("model_name") not in (None, model_name):
+                raise ValueError("model manifest model_name mismatch")
+            _verify(resolved_model_path, manifest)
+            resolved_version = str(manifest.get("version", version))
+
+            with self.lock:
+                model = joblib.load(resolved_model_path)
+                self.models[model_name] = model
+                self.model_versions[model_name] = resolved_version
+                self.model_performance[model_name] = {
+                    'loaded_at': datetime.now().isoformat(),
+                    'predictions': 0,
+                    'avg_inference_time': 0.0,
+                    'version': resolved_version
+                }
+
+            if scaler_path:
+                try:
+                    resolved_scaler_path = _resolve(scaler_path)
+                except ValueError as exc:
+                    logger.warning(f"Scaler path rejected for {model_name}: {exc}")
+                    resolved_scaler_path = None
+                if resolved_scaler_path and resolved_scaler_path.exists():
+                    scaler_manifest = _load_manifest(resolved_scaler_path, scaler_manifest_path)
+                    _verify(resolved_scaler_path, scaler_manifest)
+                    with self.lock:
+                        scaler = joblib.load(resolved_scaler_path)
+                        self.scalers[model_name] = scaler
+                    logger.info(f"Loaded scaler for {model_name}")
+                elif scaler_path:
+                    logger.warning(f"Scaler file not found or rejected: {scaler_path}")
+
+            logger.info(f"Model {model_name} v{resolved_version} loaded successfully")
+            return True
         except Exception as e:
             logger.error(f"Error loading model {model_name}: {e}")
             return False
@@ -603,13 +685,37 @@ signal_fusion = SignalFusionEngine()
 
 # Initialize Flask app with optimizations
 app = Flask(__name__)
-CORS(app)
+allowed_origins = [origin.strip() for origin in os.environ.get(
+    "AI_SERVER_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+).split(",") if origin.strip()]
+CORS(app, origins=allowed_origins or None)
 
-# Configure caching
-cache = Cache(app, config={
-    'CACHE_TYPE': 'simple',
-    'CACHE_DEFAULT_TIMEOUT': 60
-})
+# Configure caching (graceful fallback if Flask-Caching is incompatible)
+try:
+    cache = Cache(app, config={
+        'CACHE_TYPE': 'SimpleCache',
+        'CACHE_DEFAULT_TIMEOUT': 60
+    })
+    _CACHE_OK = True
+    logger.info("Flask-Caching enabled with SimpleCache backend")
+except Exception as _cache_err:  # pragma: no cover - dependency incompatibility
+    logger.warning(f"Flask-Caching unavailable ({_cache_err}); using no-op cache")
+    _CACHE_OK = False
+
+    class _NoOpCache:
+        def get(self, key):
+            return None
+
+        def set(self, key, value, timeout=None):
+            return None
+
+        def delete(self, key):
+            return None
+
+        def clear(self):
+            return None
+
+    cache = _NoOpCache()
 
 # Thread pool for parallel processing
 executor = ThreadPoolExecutor(max_workers=4)
@@ -624,11 +730,208 @@ CONFIG = {
     'dev_tunnel': {
         'enabled': False,
         'config': {}
-    }
+    },
+    'risk': {
+        'account_balance': 10000.0,
+        'account_currency': 'USD',
+        'risk_percent_per_trade': 0.01,
+        'max_daily_loss_percent': 0.05,
+        'max_drawdown_percent': 0.20,
+        'max_positions': 5,
+    },
+    'symbols': {
+        'XAUUSD': {
+            'contract_size': 100.0,
+            'tick_size': 0.01,
+            'tick_value': 1.0,
+            'volume_min': 0.01,
+            'volume_max': 100.0,
+            'volume_step': 0.01,
+            'stop_level_min_points': 10.0,
+        }
+    },
+    'trading': {
+        'demo_only': True,          # never silently switch to live trading
+        'allow_live': False,        # fail-closed unless explicitly enabled
+    },
 }
 
 # Dev tunnel client (initialized later if configured)
 dev_tunnel_client = None
+
+
+class RiskManager:
+    """Broker-aware position sizing and pre-trade risk validation."""
+
+    def __init__(self, risk_cfg: Dict, symbol_specs: Dict[str, Dict] = None):
+        self.account_balance = float(risk_cfg.get('account_balance', 0.0) or 0.0)
+        self.account_currency = str(risk_cfg.get('account_currency', 'USD'))
+        self.risk_percent_per_trade = float(risk_cfg.get('risk_percent_per_trade', 0.01))
+        self.max_daily_loss_percent = float(risk_cfg.get('max_daily_loss_percent', 0.05))
+        self.max_drawdown_percent = float(risk_cfg.get('max_drawdown_percent', 0.20))
+        self.max_positions = int(risk_cfg.get('max_positions', 5))
+        self.symbol_specs = symbol_specs or {}
+        self.open_positions = 0
+        self.daily_loss_usd = 0.0
+        self.equity = self.account_balance
+        self._validate_config()
+
+    def _validate_config(self):
+        if not (0 < self.risk_percent_per_trade <= 1):
+            raise ValueError("risk_percent_per_trade must be in (0, 1]")
+        if not (0 < self.max_daily_loss_percent <= 1):
+            raise ValueError("max_daily_loss_percent must be in (0, 1]")
+        if not (0 < self.max_drawdown_percent <= 1):
+            raise ValueError("max_drawdown_percent must be in (0, 1]")
+        if self.max_positions < 1:
+            raise ValueError("max_positions must be >= 1")
+
+    def _is_finite(self, value) -> bool:
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
+
+    def _get_symbol_specs(self, symbol: str) -> Dict:
+        if not symbol:
+            return None
+        specs = self.symbol_specs.get(symbol)
+        if not specs:
+            return None
+        required = ['contract_size', 'tick_size', 'volume_min', 'volume_max',
+                    'volume_step', 'stop_level_min_points']
+        for key in required:
+            if key not in specs or not self._is_finite(specs[key]):
+                return None
+        return specs
+
+    def calculate_position_size(
+        self,
+        entry_price: float,
+        stop_loss_price: float,
+        symbol: str = 'XAUUSD',
+        symbol_specs: Dict = None,
+        side: str = 'BUY',
+    ) -> Optional[Dict]:
+        """Calculate a broker-aware position size in lots.
+
+        Returns a dict with volume/risk details, or None if the trade
+        fails any safety check. Volumes are rounded DOWN to the volume
+        step; if the minimum volume exceeds the risk budget, the trade
+        is rejected.
+        """
+        if side not in ('BUY', 'SELL'):
+            return None
+        if not (self._is_finite(entry_price) and self._is_finite(stop_loss_price)):
+            return None
+        entry_price = float(entry_price)
+        stop_loss_price = float(stop_loss_price)
+        if entry_price <= 0 or stop_loss_price <= 0:
+            return None
+        stop_distance_price = abs(entry_price - stop_loss_price)
+        if stop_distance_price <= 0:
+            return None
+        # Direction consistency: a BUY stop must be below entry; a SELL stop above.
+        if side == 'BUY' and not (stop_loss_price < entry_price):
+            return None
+        if side == 'SELL' and not (stop_loss_price > entry_price):
+            return None
+        if not self._is_finite(self.account_balance) or self.account_balance <= 0:
+            return None
+        if not self._is_finite(self.equity) or self.equity <= 0:
+            return None
+        max_daily_loss_usd = self.account_balance * self.max_daily_loss_percent
+        if self.daily_loss_usd >= max_daily_loss_usd:
+            return None
+        max_drawdown_usd = self.account_balance * self.max_drawdown_percent
+        if (self.account_balance - self.equity) >= max_drawdown_usd:
+            return None
+        if self.open_positions >= self.max_positions:
+            return None
+        specs = symbol_specs or self._get_symbol_specs(symbol)
+        if specs is None:
+            return None
+        # Validate that all required keys exist when symbol_specs is passed (must be before float() accesses)
+        if symbol_specs is not None:
+            required = ['contract_size', 'tick_size', 'volume_min', 'volume_max', 'volume_step', 'stop_level_min_points']
+            for key in required:
+                if key not in specs:
+                    return None
+        contract_size = float(specs['contract_size'])
+        tick_size = float(specs['tick_size'])
+        volume_min = float(specs['volume_min'])
+        volume_max = float(specs['volume_max'])
+        volume_step = float(specs['volume_step'])
+        stop_level_min_points = float(specs['stop_level_min_points'])
+        if contract_size <= 0 or tick_size <= 0 or volume_step <= 0:
+            return None
+        if volume_min < 0 or volume_max <= 0 or volume_min > volume_max:
+            return None
+        min_stop_distance_price = stop_level_min_points * tick_size
+        if stop_distance_price < min_stop_distance_price:
+            return None
+        risk_amount = self.equity * self.risk_percent_per_trade
+        value_at_risk_per_lot = stop_distance_price * contract_size
+        if value_at_risk_per_lot <= 0:
+            return None
+        raw_lots = risk_amount / value_at_risk_per_lot
+        if raw_lots <= 0 or not math.isfinite(raw_lots):
+            return None
+        volume = min(raw_lots, volume_max)
+        clamped = volume < raw_lots
+        if volume_step > 0:
+            volume = math.floor(volume / volume_step) * volume_step
+        if volume < volume_min:
+            return None
+        final_value_at_risk = volume * stop_distance_price * contract_size
+        if final_value_at_risk > risk_amount + 1e-9:
+            volume = math.floor((volume - volume_step) / volume_step) * volume_step
+            if volume < volume_min:
+                return None
+        if not math.isfinite(volume) or volume <= 0:
+            return None
+        return {
+            'volume': round(volume, 8),
+            'side': side,
+            'symbol': symbol,
+            'entry_price': entry_price,
+            'stop_loss_price': stop_loss_price,
+            'stop_distance_price': stop_distance_price,
+            'risk_amount_usd': round(risk_amount, 4),
+            'value_at_risk_usd': round(final_value_at_risk, 4),
+            'contract_size': contract_size,
+            'clamped': bool(clamped),
+            'raw_lots': round(raw_lots, 8),
+        }
+
+    def can_trade(self) -> bool:
+        if self.open_positions >= self.max_positions:
+            return False
+        max_daily_loss_usd = self.account_balance * self.max_daily_loss_percent
+        if self.daily_loss_usd >= max_daily_loss_usd:
+            return False
+        return True
+
+
+def get_api_key() -> Optional[str]:
+    value = os.environ.get("AI_SERVER_API_KEY")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+def require_api_key(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        expected = get_api_key()
+        supplied = request.headers.get("X-API-Key") or request.headers.get("Authorization", "").replace("Bearer ", "", 1)
+        if not expected:
+            logger.warning("Protected endpoint requested while AI_SERVER_API_KEY is unset")
+            return jsonify({"error": "Unauthorized"}), 401
+        if not supplied or not hmac.compare_digest(str(supplied), expected):
+            return jsonify({"error": "Unauthorized"}), 401
+        return view(*args, **kwargs)
+    return wrapped
+
+# Global risk manager built from CONFIG
+risk_manager = RiskManager(CONFIG['risk'], CONFIG['symbols'])
 
 async def get_connection_pool():
     """Get or create HTTP connection pool for external requests"""
@@ -643,59 +946,159 @@ async def get_connection_pool():
         )
     return CONFIG['connection_pool']
 
-def load_config() -> bool:
-    """Load configuration with intelligent caching"""
+def _safe_float(value, default=None):
     try:
-        # Check cache (5 minute cache)
-        if (CONFIG['last_config_update'] and 
-            (datetime.now() - CONFIG['last_config_update']).seconds < 300):
-            return True
-        
-        # Try multiple config paths
-        config_paths = [
-            'config/settings.json',
-            'aiGoldScalper/config/settings.json',
-            os.path.join(os.path.dirname(__file__), 'config', 'settings.json')
-        ]
-        
-        settings = None
-        for config_path in config_paths:
-            try:
-                if os.path.exists(config_path):
-                    with open(config_path, 'r') as f:
-                        settings = json.load(f)
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(result):
+        return default
+    return result
+
+def _as_mapping(value):
+    return value if isinstance(value, dict) else {}
+
+def load_config() -> bool:
+    """Load configuration from supported nested and flat schemas.
+
+    Precedence: CONFIG_FILE env, config/settings.json, config/config.json,
+    root config.json, then aiGoldScalper/config/settings.json. Existing
+    in-memory defaults are updated, never overwritten on disk.
+    """
+    global risk_manager, dev_tunnel_client
+    config_paths = []
+    env_path = os.environ.get("CONFIG_FILE")
+    if env_path:
+        config_paths.append(env_path)
+    config_paths.extend([
+        os.path.join("config", "settings.json"),
+        os.path.join("config", "config.json"),
+        "config.json",
+        os.path.join("aiGoldScalper", "config", "settings.json"),
+    ])
+
+    settings = None
+    loaded_from = None
+    for config_path in config_paths:
+        try:
+            if config_path and os.path.exists(config_path):
+                with open(config_path, "r", encoding="utf-8") as f:
+                    parsed = json.load(f)
+                if isinstance(parsed, dict):
+                    settings = parsed
+                    loaded_from = config_path
                     logger.info(f"Config loaded from: {config_path}")
                     break
-            except Exception as e:
-                logger.warning(f"Failed to load config from {config_path}: {e}")
-                continue
-        
-        if not settings:
-            logger.warning("No config file found, using defaults")
-            return False
-        
-        # Configure OpenAI
-        api_key = settings.get('openai_api_key', '')
-        if api_key and api_key != 'YOUR_OPENAI_API_KEY_HERE':
-            CONFIG['openai_api_key'] = api_key
-            openai.api_key = api_key
-            CONFIG['use_gpt4'] = True
-            logger.info("OpenAI API key configured")
-        
-        # Configure dev tunnel
-        dev_tunnel_config = settings.get('dev_tunnel', {})
-        if dev_tunnel_config.get('enabled', False):
-            CONFIG['dev_tunnel'] = dev_tunnel_config
-            global dev_tunnel_client
-            dev_tunnel_client = DevTunnelClient(dev_tunnel_config)
-            logger.info("Dev tunnel client configured")
-        
-        CONFIG['last_config_update'] = datetime.now()
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error loading config: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to load config from {config_path}: {e}")
+            continue
+
+    if not settings:
+        logger.warning("No config file found, using defaults")
+        CONFIG["last_config_update"] = datetime.now()
         return False
+
+    # Nested and flat AI settings.
+    ai_settings = _as_mapping(settings.get("ai"))
+    openai_key = (
+        os.environ.get("OPENAI_API_KEY")
+        or ai_settings.get("api_key")
+        or settings.get("openai_api_key")
+    )
+    if isinstance(openai_key, str):
+        openai_key = openai_key.strip()
+    if openai_key and openai_key not in ("", "YOUR_OPENAI_API_KEY_HERE", None):
+        CONFIG["openai_api_key"] = openai_key
+        try:
+            openai.api_key = openai_key
+        except Exception:
+            pass
+        CONFIG["use_gpt4"] = True
+        logger.info("OpenAI API key configured")
+    else:
+        CONFIG["openai_api_key"] = None
+        CONFIG["use_gpt4"] = False
+
+    # Dev tunnel settings (nested or flat).
+    tunnel_settings = _as_mapping(settings.get("dev_tunnel"))
+    if tunnel_settings.get("enabled", False):
+        CONFIG["dev_tunnel"] = tunnel_settings
+        try:
+            dev_tunnel_client = DevTunnelClient(tunnel_settings)
+            logger.info("Dev tunnel client configured")
+        except Exception as e:
+            logger.warning(f"Dev tunnel client could not be initialized: {e}")
+    elif settings.get("dev_tunnel_enabled") is True:
+        logger.info("Dev tunnel requested but no valid configuration provided")
+
+    # Risk settings (nested risk object or flat keys).
+    risk_settings = _as_mapping(settings.get("risk"))
+    risk_updates = {}
+    flat_risk_map = {
+        "account_balance": "account_balance",
+        "default_account_balance": "account_balance",
+        "account_currency": "account_currency",
+        "risk_percent_per_trade": "risk_percent_per_trade",
+        "max_daily_loss_percent": "max_daily_loss_percent",
+        "max_drawdown_percent": "max_drawdown_percent",
+        "max_positions": "max_positions",
+    }
+    for source_key, target_key in flat_risk_map.items():
+        if source_key in settings and target_key not in risk_updates:
+            risk_updates[target_key] = settings[source_key]
+        if source_key in risk_settings:
+            risk_updates[target_key] = risk_settings[source_key]
+    for key, value in risk_updates.items():
+        if key == "account_balance":
+            parsed = _safe_float(value)
+            if parsed is not None and parsed > 0:
+                CONFIG["risk"][key] = parsed
+        elif key == "max_positions":
+            try:
+                parsed = int(value)
+                if parsed >= 1:
+                    CONFIG["risk"][key] = parsed
+            except (TypeError, ValueError):
+                pass
+        elif key == "account_currency":
+            if isinstance(value, str) and value.strip():
+                CONFIG["risk"][key] = value.strip()
+        else:
+            parsed = _safe_float(value)
+            if parsed is not None and 0 < parsed <= 1:
+                CONFIG["risk"][key] = parsed
+
+    # Symbol specifications (nested symbols object).
+    symbols = _as_mapping(settings.get("symbols"))
+    if symbols:
+        merged_symbols = dict(CONFIG.get("symbols", {}))
+        for symbol, specs in symbols.items():
+            if not isinstance(specs, dict):
+                continue
+            merged = dict(merged_symbols.get(symbol, {}))
+            for spec_key in ("contract_size", "tick_size", "tick_value", "volume_min", "volume_max", "volume_step", "stop_level_min_points"):
+                if spec_key in specs:
+                    parsed = _safe_float(specs[spec_key])
+                    if parsed is not None:
+                        merged[spec_key] = parsed
+            merged_symbols[symbol] = merged
+        CONFIG["symbols"] = merged_symbols
+
+    # Server host/port (diagnostics only; binding remains explicit).
+    server_settings = _as_mapping(settings.get("server"))
+    if server_settings.get("version"):
+        CONFIG["server_version"] = str(server_settings["version"])
+
+    # Rebuild global risk manager from validated configuration.
+    try:
+        risk_manager = RiskManager(CONFIG["risk"], CONFIG["symbols"])
+    except Exception as e:
+        logger.error(f"Risk manager could not be rebuilt from config: {e}")
+
+    CONFIG["last_config_update"] = datetime.now()
+    logger.info(f"Configuration loaded from {loaded_from}")
+    return True
+
 
 def initialize_models():
     """Initialize ML models from the trained models directory"""
@@ -705,8 +1108,16 @@ def initialize_models():
         # Load feature list
         feature_path = os.path.join(models_dir, "feature_list.pkl")
         if os.path.exists(feature_path):
-            model_engine.feature_list = joblib.load(feature_path)
-            logger.info(f"Loaded {len(model_engine.feature_list)} features")
+            feature_manifest = Path(feature_path).with_name("feature_list.manifest.json")
+            if feature_manifest.exists():
+                try:
+                    model_engine.feature_list = joblib.load(feature_path)
+                    logger.info(f"Loaded {len(model_engine.feature_list)} features")
+                except Exception as e:
+                    logger.warning(f"Feature list not loaded: {e}")
+                    model_engine.feature_list = None
+            else:
+                logger.info("Feature list present but no trusted manifest; skipping")
         
         # Load Random Forest Classifier
         rf_model_path = os.path.join(models_dir, "rf_classifier.pkl")
@@ -748,9 +1159,10 @@ def health_check():
         })
     except Exception as e:
         logger.error(f"Health check error: {e}")
-        return jsonify({"status": "unhealthy", "error": str(e)}), 500
+        return jsonify({"status": "unhealthy", "error": "Health check failed"}), 500
 
 @app.route('/ai_signal', methods=['POST'])
+@require_api_key
 def get_ai_signal():
     """Main endpoint for consolidated AI trading signals"""
     start_time = time.time()
@@ -758,8 +1170,16 @@ def get_ai_signal():
     error = False
     
     try:
-        # Get market data
-        market_data = request.get_json()
+        if not request.is_json:
+            error = True
+            return jsonify({"error": "Request must be JSON"}), 400
+        market_data = request.get_json(silent=True)
+        if not isinstance(market_data, dict):
+            error = True
+            return jsonify({"error": "Invalid market data payload"}), 400
+        if request.content_length and request.content_length > 1_000_000:
+            error = True
+            return jsonify({"error": "Request payload too large"}), 413
         if not market_data:
             error = True
             return jsonify({"error": "No market data provided"}), 400
@@ -841,7 +1261,6 @@ def get_ai_signal():
         perf_monitor.log_request(time.time() - start_time, error=True, cached=cached)
         return jsonify({
             "error": "Signal processing failed",
-            "details": str(e),
             "timestamp": datetime.now().isoformat(),
             "server_version": CONFIG['server_version']
         }), 500
@@ -1056,6 +1475,7 @@ async def calculate_gpt4_signal(market_data: Dict) -> Optional[Dict]:
         return None
 
 @app.route('/models/status', methods=['GET'])
+@require_api_key
 def get_models_status():
     """Get status of loaded models"""
     try:
@@ -1067,9 +1487,10 @@ def get_models_status():
         })
     except Exception as e:
         logger.error(f"Model status error: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Model status unavailable"}), 500
 
 @app.route('/performance', methods=['GET'])
+@require_api_key
 def get_performance_stats():
     """Get detailed performance statistics"""
     try:
@@ -1077,7 +1498,155 @@ def get_performance_stats():
         return jsonify(stats)
     except Exception as e:
         logger.error(f"Performance stats error: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Performance statistics unavailable"}), 500
+
+# Risk Management Endpoint
+@app.route('/risk-management', methods=['POST'])
+@require_api_key
+def risk_management():
+    """
+    Handle AI-managed risk management requests from EA.
+    Receives market data and risk constraints, returns risk parameters.
+    """
+    try:
+        if not request.is_json:
+            return jsonify({"error": "Request must be JSON"}), 400
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "Invalid request payload"}), 400
+        if request.content_length and request.content_length > 1_000_000:
+            return jsonify({"error": "Request payload too large"}), 413
+
+        required = ("entry_price", "stop_loss_price", "side", "symbol")
+        missing = [field for field in required if field not in data]
+        if missing:
+            return jsonify({"error": f"Missing required fields: {', '.join(missing)}"}), 400
+
+        side = str(data.get("side")).strip().upper()
+        if side not in ("BUY", "SELL"):
+            return jsonify({"error": "side must be BUY or SELL"}), 400
+
+        symbol = str(data.get("symbol")).strip()
+        if not symbol or len(symbol) > 32:
+            return jsonify({"error": "Invalid symbol"}), 400
+
+        entry_price = _safe_float(data.get("entry_price"))
+        stop_loss_price = _safe_float(data.get("stop_loss_price"))
+        if entry_price is None or stop_loss_price is None:
+            return jsonify({"error": "entry_price and stop_loss_price must be finite numbers"}), 400
+        if entry_price <= 0 or stop_loss_price <= 0:
+            return jsonify({"error": "Prices must be positive"}), 400
+
+        confidence = _safe_float(data.get("confidence", 100))
+        if confidence is None or confidence < 0 or confidence > 100:
+            return jsonify({"error": "confidence must be a finite number between 0 and 100"}), 400
+
+        current_risk = _safe_float(data.get("current_risk", 0.0), 0.0)
+        if current_risk is None or current_risk < 0 or current_risk > 1:
+            return jsonify({"error": "current_risk must be between 0 and 1"}), 400
+
+        account_balance_override = None
+        if "account_balance" in data and data.get("account_balance") is not None:
+            account_balance_override = _safe_float(data.get("account_balance"))
+            if account_balance_override is None or account_balance_override <= 0 or account_balance_override > 1e12:
+                return jsonify({"error": "account_balance must be a positive finite number"}), 400
+
+        account_currency = data.get("account_currency")
+        if account_currency is not None and (not isinstance(account_currency, str) or not account_currency.strip()):
+            return jsonify({"error": "account_currency must be a non-empty string"}), 400
+
+        tp_override = None
+        if "tp" in data and data.get("tp") is not None:
+            tp_override = _safe_float(data.get("tp"))
+            if tp_override is None:
+                return jsonify({"error": "tp must be a finite number"}), 400
+
+        symbol_specs_override = None
+        if "symbol_specs" in data and data.get("symbol_specs") is not None:
+            raw_specs = data.get("symbol_specs")
+            if not isinstance(raw_specs, dict):
+                return jsonify({"error": "symbol_specs must be an object"}), 400
+            required_specs = ["contract_size", "tick_size", "volume_min", "volume_max", "volume_step", "stop_level_min_points"]
+            missing_specs = [key for key in required_specs if key not in raw_specs]
+            if missing_specs:
+                return jsonify({"error": f"symbol_specs missing: {', '.join(missing_specs)}"}), 400
+            symbol_specs_override = {}
+            for key in required_specs + ["tick_value"]:
+                if key in raw_specs:
+                    parsed = _safe_float(raw_specs.get(key))
+                    if parsed is None:
+                        return jsonify({"error": f"symbol_specs.{key} must be finite"}), 400
+                    symbol_specs_override[key] = parsed
+            if symbol_specs_override.get("contract_size", 0) <= 0:
+                return jsonify({"error": "symbol_specs.contract_size must be positive"}), 400
+
+        logger.info(f"Risk management request for {symbol}: side={side}, entry={entry_price}, sl={stop_loss_price}")
+
+        risk_cfg = dict(CONFIG.get("risk", {}))
+        if account_balance_override is not None:
+            risk_cfg["account_balance"] = account_balance_override
+            risk_cfg["account_currency"] = account_currency.strip() if isinstance(account_currency, str) else risk_cfg.get("account_currency", "USD")
+        symbol_specs_map = dict(CONFIG.get("symbols", {}))
+        if symbol_specs_override is not None:
+            symbol_specs_map[symbol] = symbol_specs_override
+        elif symbol not in symbol_specs_map:
+            return jsonify({"error": f"Unsupported symbol: {symbol}"}), 400
+
+        request_risk_manager = RiskManager(risk_cfg, symbol_specs_map)
+        try:
+            request_risk_manager.open_positions = risk_manager.open_positions
+            request_risk_manager.daily_loss_usd = risk_manager.daily_loss_usd
+            request_risk_manager.equity = account_balance_override if account_balance_override is not None else risk_manager.equity
+        except Exception:
+            pass
+
+        result = request_risk_manager.calculate_position_size(
+            entry_price=entry_price,
+            stop_loss_price=stop_loss_price,
+            symbol=symbol,
+            symbol_specs=symbol_specs_map.get(symbol),
+            side=side,
+        )
+
+        stop_distance = abs(entry_price - stop_loss_price)
+        tp = tp_override if tp_override is not None else (entry_price + (2 * stop_distance if side == "BUY" else -2 * stop_distance))
+
+        if not result:
+            return jsonify({
+                "valid": False,
+                "signal": "HOLD",
+                "confidence": 0,
+                "lot_size": 0.0,
+                "sl": 0.0,
+                "tp": 0.0,
+                "error": "Risk validation failed",
+                "timestamp": datetime.now().isoformat(),
+                "server_version": CONFIG["server_version"],
+            }), 400
+
+        response = {
+            "valid": True,
+            "signal": side,
+            "confidence": confidence,
+            "lot_size": result["volume"],
+            "sl": stop_loss_price,
+            "tp": tp,
+            "risk": result,
+            "account_balance_source": "client_provided" if account_balance_override is not None else "server_configured",
+            "authoritative_for_live_trading": False,
+            "timestamp": datetime.now().isoformat(),
+            "server_version": CONFIG["server_version"],
+        }
+        logger.info(f"Risk management approved: lot_size={result['volume']}")
+        return jsonify(response)
+
+    except Exception as e:
+        logger.error(f"Risk management endpoint error: {e}", exc_info=True)
+        return jsonify({
+            "error": "Risk management request failed",
+            "timestamp": datetime.now().isoformat(),
+            "server_version": CONFIG["server_version"],
+        }), 500
 
 if __name__ == '__main__':
     logger.info("Starting Consolidated AI Server v5.0.0")
@@ -1086,10 +1655,16 @@ if __name__ == '__main__':
     logger.info(f"Dev tunnel enabled: {CONFIG['dev_tunnel'].get('enabled', False)}")
     
     # Use Waitress WSGI server for production
+    host = os.environ.get("AI_SERVER_HOST", "127.0.0.1").strip()
+    port = int(os.environ.get("AI_SERVER_PORT", "5000"))
+    allow_public = os.environ.get("AI_SERVER_ALLOW_PUBLIC_BIND", "").lower() in ("1", "true", "yes")
+    if host in ("0.0.0.0", "::") and not allow_public:
+        logger.warning("Public bind requested without AI_SERVER_ALLOW_PUBLIC_BIND; using 127.0.0.1")
+        host = "127.0.0.1"
     try:
         from waitress import serve
-        logger.info("Starting with Waitress WSGI server (Production Mode)")
-        serve(app, host='0.0.0.0', port=5000, threads=4)
+        logger.info(f"Starting with Waitress WSGI server on {host}:{port}")
+        serve(app, host=host, port=port, threads=4)
     except ImportError:
         logger.warning("Waitress not available, falling back to Flask dev server")
-        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+        app.run(host=host, port=port, debug=False, threaded=True)
