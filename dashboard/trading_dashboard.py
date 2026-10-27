@@ -7,6 +7,7 @@ Comprehensive web-based dashboard for monitoring all system components,
 trading performance, AI models, and infrastructure health.
 """
 
+import os
 import asyncio
 import json
 import logging
@@ -30,10 +31,22 @@ from plotly.utils import PlotlyJSONEncoder
 # Import our system components
 import sys
 sys.path.append('scripts')
-from data.market_data_processor import MarketDataProcessor
-from training.automated_model_trainer import AutomatedModelTrainer
-from ai.model_registry import ModelRegistry
-from integration.phase4_integration import Phase4Integration
+try:
+    from data.market_data_processor import MarketDataProcessor
+except Exception:  # pragma: no cover - optional dashboard dependency
+    MarketDataProcessor = None
+try:
+    from training.automated_model_trainer import AutomatedModelTrainer
+except Exception:  # pragma: no cover - optional dashboard dependency
+    AutomatedModelTrainer = None
+try:
+    from ai.model_registry import ModelRegistry
+except Exception:  # pragma: no cover - optional dashboard dependency
+    ModelRegistry = None
+try:
+    from integration.phase4_integration import Phase4Integration
+except Exception:  # pragma: no cover - optional dashboard dependency
+    Phase4Integration = None
 
 class TradingDashboard:
     """Production trading dashboard application"""
@@ -42,9 +55,15 @@ class TradingDashboard:
         self.app = Flask(__name__, 
                         template_folder='templates',
                         static_folder='static')
-        self.app.config['SECRET_KEY'] = 'ai_gold_scalper_dashboard'
-        
-        self.socketio = SocketIO(self.app, cors_allowed_origins="*")
+        secret_key = os.environ.get("DASHBOARD_SECRET_KEY") or os.environ.get("FLASK_SECRET_KEY")
+        if not secret_key and not debug:
+            raise RuntimeError("DASHBOARD_SECRET_KEY (or FLASK_SECRET_KEY) is required in non-debug mode")
+        self.app.config['SECRET_KEY'] = secret_key or "dev-only-insecure-dashboard-secret"
+
+        allowed_origins = [origin.strip() for origin in os.environ.get(
+            "DASHBOARD_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+        ).split(",") if origin.strip()]
+        self.socketio = SocketIO(self.app, cors_allowed_origins=allowed_origins or None)
         
         # Configuration
         self.host = host
@@ -54,7 +73,7 @@ class TradingDashboard:
         # System components
         self.market_processor = None
         self.model_trainer = None
-        self.model_registry = ModelRegistry()
+        self.model_registry = ModelRegistry() if ModelRegistry is not None else None
         self.phase4_integration = None
         
         # Data paths
