@@ -970,12 +970,13 @@ def load_config() -> bool:
     env_path = os.environ.get("CONFIG_FILE")
     if env_path:
         config_paths.append(env_path)
-    config_paths.extend([
-        os.path.join("config", "settings.json"),
-        os.path.join("config", "config.json"),
-        "config.json",
-        os.path.join("aiGoldScalper", "config", "settings.json"),
-    ])
+    else:
+        config_paths.extend([
+            os.path.join("config", "settings.json"),
+            os.path.join("config", "config.json"),
+            "config.json",
+            os.path.join("aiGoldScalper", "config", "settings.json"),
+        ])
 
     settings = None
     loaded_from = None
