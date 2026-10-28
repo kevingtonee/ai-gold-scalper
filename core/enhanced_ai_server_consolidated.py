@@ -29,6 +29,10 @@ import threading
 import hmac
 import secrets
 from pathlib import Path
+try:
+    from core.risk_state_store import RiskStateStore
+except ImportError:
+    from risk_state_store import RiskStateStore
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -930,8 +934,14 @@ def require_api_key(view):
         return view(*args, **kwargs)
     return wrapped
 
-# Global risk manager built from CONFIG
+# Persistent risk state (survives requests/restarts; day rollover handled by store)
+risk_state_store = RiskStateStore()
 risk_manager = RiskManager(CONFIG['risk'], CONFIG['symbols'])
+_loaded_risk_state = risk_state_store.load()
+risk_manager.open_positions = _loaded_risk_state['open_positions']
+risk_manager.daily_loss_usd = _loaded_risk_state['daily_loss_usd']
+if _loaded_risk_state['halted']:
+    risk_manager.max_positions = 0
 
 async def get_connection_pool():
     """Get or create HTTP connection pool for external requests"""
@@ -1106,19 +1116,12 @@ def initialize_models():
     models_dir = "models/trained"
     
     try:
-        # Load feature list
+        # Feature lists are executable pickle artifacts. They are not loaded
+        # without trusted manifest/hash verification.
         feature_path = os.path.join(models_dir, "feature_list.pkl")
         if os.path.exists(feature_path):
-            feature_manifest = Path(feature_path).with_name("feature_list.manifest.json")
-            if feature_manifest.exists():
-                try:
-                    model_engine.feature_list = joblib.load(feature_path)
-                    logger.info(f"Loaded {len(model_engine.feature_list)} features")
-                except Exception as e:
-                    logger.warning(f"Feature list not loaded: {e}")
-                    model_engine.feature_list = None
-            else:
-                logger.info("Feature list present but no trusted manifest; skipping")
+            logger.warning("Feature list present but unverified; skipping load")
+        model_engine.feature_list = None
         
         # Load Random Forest Classifier
         rf_model_path = os.path.join(models_dir, "rf_classifier.pkl")
@@ -1600,6 +1603,11 @@ def risk_management():
             request_risk_manager.equity = account_balance_override if account_balance_override is not None else risk_manager.equity
         except Exception:
             pass
+        risk_state_store.save({
+            "open_positions": risk_manager.open_positions,
+            "daily_loss_usd": risk_manager.daily_loss_usd,
+            "halted": risk_manager.max_positions <= 0,
+        })
 
         result = request_risk_manager.calculate_position_size(
             entry_price=entry_price,

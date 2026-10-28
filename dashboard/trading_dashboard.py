@@ -182,12 +182,17 @@ class TradingDashboard:
         @self.app.route('/api/control/<action>', methods=['POST'])
         def system_control(action):
             """System control endpoints"""
+            import hmac as _hmac
+            supplied = request.headers.get("X-API-Key") or request.headers.get("Authorization", "").replace("Bearer ", "", 1)
+            expected = os.environ.get("DASHBOARD_API_KEY") or os.environ.get("AI_SERVER_API_KEY")
+            if not expected or not supplied or not _hmac.compare_digest(str(supplied), str(expected).strip()):
+                return jsonify({'error': 'Unauthorized'}), 401
             try:
-                result = self._handle_system_control(action, request.json or {})
+                result = self._handle_system_control(action, request.get_json(silent=True) or {})
                 return jsonify(result)
             except Exception as e:
                 logging.error(f"System control '{action}' failed: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'error': 'System control failed'}), 500
     
     def _setup_socketio(self):
         """Setup SocketIO event handlers"""
