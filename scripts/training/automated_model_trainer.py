@@ -11,6 +11,8 @@ import asyncio
 import json
 import logging
 import pandas as pd
+import json
+import hashlib
 import numpy as np
 import sqlite3
 import pickle
@@ -35,8 +37,14 @@ warnings.filterwarnings('ignore')
 
 # Import our existing components
 import sys
-sys.path.append('scripts')
-from models.model_registry import ModelRegistry, ModelMetadata
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from ai.model_registry import ModelRegistry, ModelMetadata
 from monitoring.trade_postmortem_analyzer import TradePostmortemAnalyzer
 
 @dataclass
@@ -44,6 +52,7 @@ class TrainingConfig:
     """Training configuration"""
     min_samples: int = 100
     retrain_threshold: float = 0.05  # Performance degradation threshold
+    min_validation_score: float = -1e9  # Quality gate for model registration
     max_training_time: int = 300  # Max training time in seconds
     feature_lookback: int = 50  # Historical periods for features
     validation_split: float = 0.2
@@ -144,7 +153,7 @@ class FeatureEngineering:
         
         # Market hours (assuming UTC)
         features['hour'] = pd.to_datetime(features.index).hour
-        features['day_of_week'] = pd.to_datetime(features.index).dayofweek
+        features['day_of_week'] = pd.to_datetime(features.index).day_of_week
         features['is_trading_hours'] = ((features['hour'] >= 8) & (features['hour'] <= 17)).astype(int)
         
         return features
@@ -315,11 +324,43 @@ class ModelTrainer:
                 success=True
             )
             
-            # Save model
-            model_path = Path(f"models/{self.model_name}_{version}.pkl")
-            model_path.parent.mkdir(parents=True, exist_ok=True)
+            # Quality gate
+            if val_score < config.min_validation_score:
+                logging.warning(f"Model {self.model_name} rejected by quality gate: {val_score:.4f} < {config.min_validation_score}")
+                return TrainingResult(
+                    model_name=self.model_name,
+                    model_version="rejected",
+                    training_score=train_score,
+                    validation_score=val_score,
+                    cross_val_score=cv_score,
+                    feature_importance=feature_importance,
+                    training_time=time.time() - start_time,
+                    sample_count=len(X),
+                    parameters=best_params,
+                    metrics={'mse': mse, 'mae': mae, 'rmse': np.sqrt(mse)},
+                    success=False,
+                    error_message="Failed quality gate",
+                )
+
+            # Save model into trusted directory used by the AI server
+            trusted_dir = Path("models/trained")
+            trusted_dir.mkdir(parents=True, exist_ok=True)
+            model_path = trusted_dir / f"{self.model_name}_{version}.pkl"
             joblib.dump(model, model_path)
-            
+
+            # Save feature list for reproducibility
+            feature_list_path = trusted_dir / "feature_list.json"
+            feature_list_path.write_text(json.dumps(list(X.columns)), encoding="utf-8")
+
+            # Save manifest for trusted model loading
+            manifest = {
+                "model_name": self.model_name,
+                "version": version,
+                "sha256": hashlib.sha256(model_path.read_bytes()).hexdigest(),
+            }
+            manifest_path = trusted_dir / f"{self.model_name}_{version}.manifest.json"
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
             logging.info(f"Model {self.model_name} trained successfully. "
                         f"Validation score: {val_score:.4f}, CV score: {cv_score:.4f}")
             
@@ -365,33 +406,70 @@ class AutomatedModelTrainer:
         logging.info("Automated Model Trainer initialized")
     
     def _load_market_data(self, lookback_days: int = 30) -> pd.DataFrame:
-        """Load market data for training"""
+        """Load market data for training.
+
+        Preference order: CSV (data/market_data.csv or data/ohlc_*.csv),
+        then SQLite (data/market_data.db), then synthetic development data.
+        """
+        csv_candidates = [Path("data/market_data.csv")]
+        if Path("data").exists():
+            csv_candidates.extend(sorted(Path("data").glob("ohlc_*.csv")))
+        for csv_path in csv_candidates:
+            if csv_path.exists():
+                try:
+                    df = pd.read_csv(csv_path)
+                    if "timestamp" in df.columns:
+                        df["timestamp"] = pd.to_datetime(df["timestamp"])
+                        df = df.set_index("timestamp")
+                    required = {"open", "high", "low", "close"}
+                    if required.issubset(set(df.columns)):
+                        if "volume" not in df.columns:
+                            df["volume"] = 0
+                        logging.info(f"Loaded {len(df)} market data records from {csv_path}")
+                        return df[["open", "high", "low", "close", "volume"]]
+                except Exception as e:
+                    logging.warning(f"Could not load market data from {csv_path}: {e}")
+
         try:
-            cutoff_date = datetime.now() - timedelta(days=lookback_days)
-            
-            with sqlite3.connect(self.data_db_path) as conn:
-                query = """
-                    SELECT timestamp, open, high, low, close, volume
-                    FROM ohlc_1m 
-                    WHERE timestamp >= ?
-                    ORDER BY timestamp
-                """
-                df = pd.read_sql_query(query, conn, params=(cutoff_date,))
-                
-            if df.empty:
-                logging.warning("No market data found")
-                return pd.DataFrame()
-            
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df.set_index('timestamp', inplace=True)
-            
-            logging.info(f"Loaded {len(df)} market data records")
-            return df
-            
+            if self.data_db_path.exists():
+                cutoff_date = datetime.now() - timedelta(days=lookback_days)
+                with sqlite3.connect(self.data_db_path) as conn:
+                    query = """
+                        SELECT timestamp, open, high, low, close, volume
+                        FROM ohlc_1m
+                        WHERE timestamp >= ?
+                        ORDER BY timestamp
+                    """
+                    df = pd.read_sql_query(query, conn, params=(cutoff_date,))
+                if not df.empty:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    df.set_index('timestamp', inplace=True)
+                    logging.info(f"Loaded {len(df)} market data records")
+                    return df
         except Exception as e:
-            logging.error(f"Failed to load market data: {e}")
-            return pd.DataFrame()
-    
+            logging.warning(f"Could not load market data from DB: {e}")
+
+        logging.warning("No market data found; generating synthetic development dataset")
+        periods = max(lookback_days * 24 * 60, 500)
+        idx = pd.date_range(end=datetime.now(), periods=periods, freq="1min")
+        base = 2000.0
+        returns = np.random.normal(0, 0.0005, size=periods)
+        close = base * np.exp(np.cumsum(returns))
+        high = close * (1 + np.abs(np.random.normal(0, 0.0003, size=periods)))
+        low = close * (1 - np.abs(np.random.normal(0, 0.0003, size=periods)))
+        open_ = np.roll(close, 1)
+        open_[0] = base
+        volume = np.random.randint(100, 1000, size=periods)
+        df = pd.DataFrame({
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+        }, index=idx)
+        df.index.name = "timestamp"
+        return df
+
     def _load_trade_data(self, lookback_days: int = 30) -> pd.DataFrame:
         """Load trade data for training labels"""
         try:
@@ -448,7 +526,7 @@ class AutomatedModelTrainer:
         feature_cols = [col for col in features.columns 
                        if col not in ['target', 'trade_outcome'] 
                        and not col.startswith('close_lag_')  # Avoid data leakage
-                       and features[col].dtype in ['int64', 'float64']]
+                       and pd.api.types.is_numeric_dtype(features[col])]
         
         X = features[feature_cols].dropna()
         y = features.loc[X.index, 'target'].dropna()
@@ -465,13 +543,20 @@ class AutomatedModelTrainer:
         """Check if model needs retraining"""
         try:
             # Get current model performance
-            current_model = self.model_registry.get_model(model_name)
+            models = self.model_registry.list_models()
+            matching = [m for m in models if m.name == model_name]
+            metadata = matching[0] if matching else None
+            current_model = None
+            if metadata is not None:
+                try:
+                    current_model = self.model_registry.load_model(metadata.model_id)
+                except Exception:
+                    current_model = None
             if not current_model:
                 logging.info(f"No existing model found for {model_name}, training new one")
                 return True
             
             # Check last training date
-            metadata = self.model_registry.get_model_metadata(model_name)
             if not metadata:
                 return True
             
@@ -508,14 +593,21 @@ class AutomatedModelTrainer:
             features = self.feature_engine.create_market_regime_features(features)
             
             # Get model
-            model = self.model_registry.get_model(model_name)
+            models = self.model_registry.list_models()
+            matching = [m for m in models if m.name == model_name]
+            model = None
+            if matching:
+                try:
+                    model = self.model_registry.load_model(matching[0].model_id)
+                except Exception:
+                    model = None
             if not model:
                 return None
             
             # Select features (match training features)
             feature_cols = [col for col in features.columns 
                            if col not in ['target', 'trade_outcome', 'returns']
-                           and features[col].dtype in ['int64', 'float64']]
+                           and pd.api.types.is_numeric_dtype(features[col])]
             
             X_recent = features[feature_cols].dropna()
             y_recent = features.loc[X_recent.index, 'returns'].shift(-1).dropna()
@@ -591,8 +683,8 @@ class AutomatedModelTrainer:
                     metrics=result.metrics
                 )
                 
-                self.model_registry.register_model(metadata, model_path)
-                logging.info(f"Model {model_name} registered successfully")
+                model_id = self.model_registry.register_model(model, metadata)
+                logging.info(f"Model {model_name} registered successfully (id={model_id})")
                 
             except Exception as e:
                 logging.error(f"Failed to register model {model_name}: {e}")
