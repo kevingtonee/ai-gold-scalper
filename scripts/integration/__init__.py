@@ -1,0 +1,1 @@
+"""MT5 integration helpers (optional dependency, paper mode by default)."""

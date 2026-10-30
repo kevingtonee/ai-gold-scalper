@@ -1,5 +1,7 @@
 # AI Gold Scalper - Pre-Launch Audit & Remaining Tasks
 
+> **Status update:** This audit is partially stale. `/risk-management`, broker-aware risk sizing, persistent risk state, dashboard auth, MT5 Python integration, order journaling, reconciliation, and guarded demo execution have since been implemented and tested. Use `FEATURE_STATUS.md` for the current implementation status.
+
 ## 🚀 PRE-LAUNCH CHECKLIST
 
 ### ❌ CRITICAL TASKS (Must Complete Before Launch)

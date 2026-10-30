@@ -13,9 +13,20 @@ from datetime import datetime
 # Setup path
 import sys
 from pathlib import Path
-sys.path.append(str(Path(__file__).parent / "scripts" / "data"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from market_data_processor import MarketDataProcessor, YahooFinanceSource
+# This file is a manual smoke test, not a pytest unit test.
+try:
+    import pytest
+    if "pytest" in sys.modules:
+        pytest.skip(
+            "Manual smoke test; run directly with: python utils/test_enhanced_market_data.py",
+            allow_module_level=True,
+        )
+except Exception:
+    pass
+
+from data.market_data_processor import MarketDataProcessor, YahooFinanceSource
 
 async def test_enhanced_market_data():
     """Test the enhanced market data processor"""
